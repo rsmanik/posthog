@@ -22,6 +22,7 @@ from .transforms import (
     simplify_trends_response,
     format_for_webhook,
 )
+from .dashboard_renderer import DashboardRenderer, render_dashboard
 
 
 class HeadlessQueryViewSet(TeamAndOrgViewSetMixin, viewsets.ViewSet):
@@ -226,6 +227,269 @@ class HeadlessQueryViewSet(TeamAndOrgViewSetMixin, viewsets.ViewSet):
             "result": transformed,
             "input_count": len(results),
         })
+
+
+class HeadlessDashboardViewSet(TeamAndOrgViewSetMixin, viewsets.ViewSet):
+    """
+    Headless Dashboard Rendering API
+
+    Provides endpoints for rendering dashboards programmatically
+    in various formats (PNG, JSON, data-only).
+    """
+
+    scope_object = "dashboard"
+
+    @extend_schema(
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "format": {"type": "string", "enum": ["png", "json", "json_data"], "default": "json"},
+                    "filters": {"type": "object"},
+                    "width": {"type": "integer", "default": 1920},
+                    "height": {"type": "integer"},
+                    "max_age_seconds": {"type": "integer", "default": 3600},
+                    "include_data": {"type": "boolean", "default": True},
+                    "include_layout": {"type": "boolean", "default": True},
+                },
+            }
+        },
+        responses={200: dict},
+        description="Render dashboard in specified format",
+    )
+    @action(methods=["POST"], detail=True, url_path="render")
+    def render(self, request: Request, pk: int, **kwargs) -> Response:
+        """
+        Render a dashboard in the specified format.
+
+        This is a convenience endpoint that auto-detects the desired format
+        and delegates to the appropriate renderer.
+
+        Request body:
+            - format: "png", "json", or "json_data" (default: "json")
+            - filters: Optional dashboard filters to apply
+            - width: Width for image exports (default: 1920px)
+            - height: Height for image exports (optional)
+            - max_age_seconds: Maximum age of cached PNG export (default: 3600)
+            - include_data: Include query data in JSON export (default: True)
+            - include_layout: Include layout info in JSON export (default: True)
+
+        Returns:
+            Rendered dashboard in requested format
+        """
+        team = cast(Team, self.team)
+        format_type = request.data.get("format", "json")
+        filters = request.data.get("filters")
+        width = request.data.get("width", 1920)
+        height = request.data.get("height")
+
+        renderer = DashboardRenderer(
+            dashboard_id=pk,
+            team=team,
+            filters=filters,
+            width=width,
+            height=height,
+        )
+
+        if format_type == "png":
+            max_age = request.data.get("max_age_seconds", 3600)
+            export = renderer.render_to_png(max_age_seconds=max_age)
+
+            return Response({
+                "export_id": export.id,
+                "status": "processing" if not export.has_content else "complete",
+                "url": f"/api/projects/{team.id}/exported_assets/{export.id}/content" if export.has_content else None,
+                "created_at": export.created_at.isoformat(),
+            })
+
+        elif format_type == "json":
+            include_data = request.data.get("include_data", True)
+            include_layout = request.data.get("include_layout", True)
+            dashboard_json = renderer.render_to_json(
+                include_data=include_data,
+                include_layout=include_layout,
+            )
+            return Response(dashboard_json)
+
+        elif format_type == "json_data":
+            dashboard_data = renderer.get_dashboard_data()
+            return Response(dashboard_data)
+
+        else:
+            return Response(
+                {"error": f"Unsupported format: {format_type}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+    @extend_schema(
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "filters": {"type": "object"},
+                    "width": {"type": "integer", "default": 1920},
+                    "height": {"type": "integer"},
+                    "max_age_seconds": {"type": "integer", "default": 3600},
+                },
+            }
+        },
+        responses={200: dict},
+        description="Render dashboard as PNG image",
+    )
+    @action(methods=["POST"], detail=True, url_path="render/png")
+    def render_png(self, request: Request, pk: int, **kwargs) -> Response:
+        """
+        Render a dashboard as PNG image.
+
+        This uses PostHog's existing Selenium-based screenshot system.
+        The export is asynchronous and may take several seconds to complete.
+
+        Request body:
+            - filters: Optional dashboard filters to apply
+            - width: Width in pixels (default: 1920)
+            - height: Height in pixels (optional, auto-calculated if not provided)
+            - max_age_seconds: Maximum age of cached export to use (default: 3600)
+
+        Returns:
+            Export metadata with status and URL when complete
+        """
+        team = cast(Team, self.team)
+        filters = request.data.get("filters")
+        width = request.data.get("width", 1920)
+        height = request.data.get("height")
+        max_age = request.data.get("max_age_seconds", 3600)
+
+        renderer = DashboardRenderer(
+            dashboard_id=pk,
+            team=team,
+            filters=filters,
+            width=width,
+            height=height,
+        )
+
+        export = renderer.render_to_png(max_age_seconds=max_age)
+
+        return Response({
+            "export_id": export.id,
+            "status": "processing" if not export.has_content else "complete",
+            "url": f"/api/projects/{team.id}/exported_assets/{export.id}/content" if export.has_content else None,
+            "created_at": export.created_at.isoformat(),
+            "dashboard_id": pk,
+        })
+
+    @extend_schema(
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "filters": {"type": "object"},
+                    "include_data": {"type": "boolean", "default": True},
+                    "include_layout": {"type": "boolean", "default": True},
+                },
+            }
+        },
+        responses={200: dict},
+        description="Render dashboard as JSON with structure and data",
+    )
+    @action(methods=["POST"], detail=True, url_path="render/json")
+    def render_json(self, request: Request, pk: int, **kwargs) -> Response:
+        """
+        Render a dashboard as JSON structure.
+
+        This provides a complete JSON representation of the dashboard,
+        including metadata, layout, and optionally query results data.
+
+        Request body:
+            - filters: Optional dashboard filters to apply
+            - include_data: Include query results for each tile (default: True)
+            - include_layout: Include layout information (default: True)
+
+        Returns:
+            Complete dashboard structure as JSON
+        """
+        team = cast(Team, self.team)
+        filters = request.data.get("filters")
+        include_data = request.data.get("include_data", True)
+        include_layout = request.data.get("include_layout", True)
+
+        renderer = DashboardRenderer(
+            dashboard_id=pk,
+            team=team,
+            filters=filters,
+        )
+
+        dashboard_json = renderer.render_to_json(
+            include_data=include_data,
+            include_layout=include_layout,
+        )
+
+        return Response(dashboard_json)
+
+    @extend_schema(
+        request={
+            "application/json": {
+                "type": "object",
+                "properties": {
+                    "filters": {"type": "object"},
+                },
+            }
+        },
+        responses={200: dict},
+        description="Get dashboard data only (no structure)",
+    )
+    @action(methods=["POST"], detail=True, url_path="render/data")
+    def render_data(self, request: Request, pk: int, **kwargs) -> Response:
+        """
+        Get just the data for each dashboard tile.
+
+        This is useful when you want raw query results without
+        layout, metadata, or other structural information.
+
+        Request body:
+            - filters: Optional dashboard filters to apply
+
+        Returns:
+            Dictionary mapping tile IDs to their query results
+        """
+        team = cast(Team, self.team)
+        filters = request.data.get("filters")
+
+        renderer = DashboardRenderer(
+            dashboard_id=pk,
+            team=team,
+            filters=filters,
+        )
+
+        dashboard_data = renderer.get_dashboard_data()
+
+        return Response(dashboard_data)
+
+    @extend_schema(
+        responses={200: dict},
+        description="Get dashboard summary without executing queries",
+    )
+    @action(methods=["GET"], detail=True, url_path="summary")
+    def summary(self, request: Request, pk: int, **kwargs) -> Response:
+        """
+        Get a lightweight summary of the dashboard.
+
+        This provides dashboard metadata and structure without
+        executing any queries, making it fast and suitable for
+        previews and listings.
+
+        Returns:
+            Dashboard summary with metadata
+        """
+        team = cast(Team, self.team)
+
+        renderer = DashboardRenderer(
+            dashboard_id=pk,
+            team=team,
+        )
+
+        summary_data = renderer.export_summary()
+
+        return Response(summary_data)
 
 
 class HeadlessDataViewSet(TeamAndOrgViewSetMixin, viewsets.ViewSet):

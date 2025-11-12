@@ -6,10 +6,11 @@ These endpoints are designed for programmatic/headless access to PostHog data.
 
 from rest_framework import routers
 
-from .views import HeadlessQueryViewSet, HeadlessDataViewSet
+from .views import HeadlessQueryViewSet, HeadlessDataViewSet, HeadlessDashboardViewSet
 
 router = routers.DefaultRouter()
 router.register(r"query", HeadlessQueryViewSet, basename="headless_query")
 router.register(r"data", HeadlessDataViewSet, basename="headless_data")
+router.register(r"dashboards", HeadlessDashboardViewSet, basename="headless_dashboards")
 
 urlpatterns = router.urls

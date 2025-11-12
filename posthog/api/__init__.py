@@ -3,6 +3,7 @@ from rest_framework_extensions.routers import NestedRegistryItem
 
 from posthog.api import data_color_theme, hog_flow, llm_gateway, metalytics, my_notifications, project
 from posthog.api.batch_imports import BatchImportViewSet
+from posthog.api.headless.views import HeadlessQueryViewSet, HeadlessDataViewSet, HeadlessDashboardViewSet
 from posthog.api.csp_reporting import CSPReportingViewSet
 from posthog.api.routing import DefaultRouterPlusPlus
 from posthog.api.wizard import http as wizard
@@ -394,6 +395,26 @@ projects_router.register(
     ["project_id"],
 )
 register_grandfathered_environment_nested_viewset(r"query", query.QueryViewSet, "environment_query", ["team_id"])
+
+# Headless API endpoints
+register_grandfathered_environment_nested_viewset(
+    r"headless/query",
+    HeadlessQueryViewSet,
+    "environment_headless_query",
+    ["team_id"],
+)
+register_grandfathered_environment_nested_viewset(
+    r"headless/data",
+    HeadlessDataViewSet,
+    "environment_headless_data",
+    ["team_id"],
+)
+register_grandfathered_environment_nested_viewset(
+    r"headless/dashboards",
+    HeadlessDashboardViewSet,
+    "environment_headless_dashboards",
+    ["team_id"],
+)
 
 # External data resources
 register_grandfathered_environment_nested_viewset(
