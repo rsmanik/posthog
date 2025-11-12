@@ -1,0 +1,287 @@
+"""
+Headless API Views
+
+Provides REST API endpoints optimized for headless/programmatic access.
+These endpoints focus on data delivery without UI concerns.
+"""
+
+from typing import Any, cast
+from rest_framework import status, viewsets
+from rest_framework.decorators import action
+from rest_framework.request import Request
+from rest_framework.response import Response
+
+from posthog.api.documentation import extend_schema
+from posthog.api.routing import TeamAndOrgViewSetMixin
+from posthog.hogql_queries.query_runner import ExecutionMode, get_query_runner
+from posthog.models import Team
+from posthog.schema import QuerySchemaRoot
+
+from .transforms import (
+    DataTransforms,
+    simplify_trends_response,
+    format_for_webhook,
+)
+
+
+class HeadlessQueryViewSet(TeamAndOrgViewSetMixin, viewsets.ViewSet):
+    """
+    Headless Query API
+
+    Provides simplified, headless-friendly endpoints for executing queries
+    and retrieving data in various formats.
+
+    All endpoints return pure JSON data optimized for programmatic consumption.
+    """
+
+    scope_object = "query"
+
+    @extend_schema(
+        request=QuerySchemaRoot,
+        responses={200: dict},
+        description="Execute a query and return results in a normalized format",
+    )
+    @action(methods=["POST"], detail=False)
+    def execute(self, request: Request, **kwargs) -> Response:
+        """
+        Execute a query and return normalized results.
+
+        This endpoint wraps the standard /api/query/ endpoint but provides
+        additional normalization and simplification for headless consumers.
+
+        Request body should contain a valid QuerySchema object.
+
+        Returns:
+            Normalized query response with consistent structure
+        """
+        team = cast(Team, self.team)
+        query_json = request.data
+
+        # Execute the query using PostHog's query runner
+        query_runner = get_query_runner(query_json, team)
+
+        result = query_runner.run(execution_mode=ExecutionMode.RECENT_CACHE_CALCULATE_BLOCKING_IF_STALE)
+
+        # Normalize the response
+        normalized = DataTransforms.normalize_query_response(result.model_dump())
+
+        return Response(normalized)
+
+    @extend_schema(
+        request=QuerySchemaRoot,
+        responses={200: dict},
+        description="Execute a query and return simplified results optimized for trends",
+    )
+    @action(methods=["POST"], detail=False, url_path="execute/trends")
+    def execute_trends(self, request: Request, **kwargs) -> Response:
+        """
+        Execute a Trends query and return simplified results.
+
+        This endpoint is optimized for Trends queries and provides
+        a simplified response structure that's easier to consume.
+
+        Returns:
+            Simplified trends response
+        """
+        team = cast(Team, self.team)
+        query_json = request.data
+
+        query_runner = get_query_runner(query_json, team)
+        result = query_runner.run(execution_mode=ExecutionMode.RECENT_CACHE_CALCULATE_BLOCKING_IF_STALE)
+
+        # Simplify for trends
+        simplified = simplify_trends_response(result.model_dump())
+
+        return Response(simplified)
+
+    @extend_schema(
+        request=QuerySchemaRoot,
+        responses={200: str},
+        description="Execute a query and return results in CSV format",
+    )
+    @action(methods=["POST"], detail=False, url_path="execute/csv")
+    def execute_csv(self, request: Request, **kwargs) -> Response:
+        """
+        Execute a query and return results as CSV.
+
+        Useful for exports, reports, and data analysis tools.
+
+        Returns:
+            CSV-formatted string
+        """
+        team = cast(Team, self.team)
+        query_json = request.data
+
+        query_runner = get_query_runner(query_json, team)
+        result = query_runner.run(execution_mode=ExecutionMode.RECENT_CACHE_CALCULATE_BLOCKING_IF_STALE)
+
+        # Convert to CSV
+        results = result.model_dump().get("results", [])
+        csv_data = DataTransforms.convert_to_csv_format(results)
+
+        return Response(
+            csv_data,
+            content_type="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="posthog_export.csv"'
+            }
+        )
+
+    @extend_schema(
+        request=QuerySchemaRoot,
+        responses={200: dict},
+        description="Execute a query and return results formatted for webhook delivery",
+    )
+    @action(methods=["POST"], detail=False, url_path="execute/webhook")
+    def execute_webhook(self, request: Request, **kwargs) -> Response:
+        """
+        Execute a query and format results for webhook delivery.
+
+        Provides a compact payload suitable for sending to webhooks,
+        with only essential data and summary statistics.
+
+        Returns:
+            Webhook-formatted response
+        """
+        team = cast(Team, self.team)
+        query_json = request.data
+
+        query_runner = get_query_runner(query_json, team)
+        result = query_runner.run(execution_mode=ExecutionMode.RECENT_CACHE_CALCULATE_BLOCKING_IF_STALE)
+
+        # Format for webhook
+        webhook_payload = format_for_webhook(result.model_dump())
+
+        return Response(webhook_payload)
+
+    @extend_schema(
+        request=dict,
+        responses={200: dict},
+        description="Transform query results using various transformation functions",
+    )
+    @action(methods=["POST"], detail=False, url_path="transform")
+    def transform(self, request: Request, **kwargs) -> Response:
+        """
+        Apply transformations to query results.
+
+        This endpoint allows you to apply various transformations to
+        already-fetched query results without re-executing the query.
+
+        Request body should contain:
+        - results: The results to transform
+        - transform: The transformation to apply (flatten, pivot, summary, etc.)
+        - options: Optional transformation-specific options
+
+        Returns:
+            Transformed results
+        """
+        results = request.data.get("results", [])
+        transform_type = request.data.get("transform")
+        options = request.data.get("options", {})
+
+        transforms = DataTransforms()
+
+        if transform_type == "flatten":
+            transformed = transforms.flatten_breakdown_results(results)
+        elif transform_type == "pivot":
+            transformed = transforms.pivot_breakdown_data(
+                results,
+                row_field=options.get("row_field", "date"),
+                column_field=options.get("column_field", "breakdown"),
+                value_field=options.get("value_field", "value"),
+            )
+        elif transform_type == "summary":
+            transformed = transforms.extract_summary_statistics(
+                results,
+                value_field=options.get("value_field", "value"),
+            )
+        elif transform_type == "aggregate":
+            transformed = transforms.aggregate_by_time_period(
+                results,
+                time_field=options.get("time_field", "date"),
+                value_field=options.get("value_field", "value"),
+                aggregation=options.get("aggregation", "sum"),
+            )
+        elif transform_type == "percent_change":
+            current = request.data.get("current", [])
+            previous = request.data.get("previous", [])
+            transformed = transforms.calculate_percent_change(
+                current,
+                previous,
+                value_field=options.get("value_field", "value"),
+            )
+        elif transform_type == "csv":
+            transformed = transforms.convert_to_csv_format(
+                results,
+                columns=options.get("columns"),
+            )
+        else:
+            return Response(
+                {"error": f"Unknown transform type: {transform_type}"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        return Response({
+            "transform": transform_type,
+            "result": transformed,
+            "input_count": len(results),
+        })
+
+
+class HeadlessDataViewSet(TeamAndOrgViewSetMixin, viewsets.ViewSet):
+    """
+    Headless Data Access API
+
+    Provides simplified endpoints for common data access patterns
+    without requiring complex query construction.
+    """
+
+    scope_object = "INTERNAL"  # TODO: Update when scope is defined
+
+    @extend_schema(
+        responses={200: dict},
+        description="Get summary statistics for a date range",
+    )
+    @action(methods=["GET"], detail=False, url_path="summary")
+    def summary(self, request: Request, **kwargs) -> Response:
+        """
+        Get summary statistics for the current team.
+
+        Returns high-level metrics like total events, unique users, etc.
+
+        Query Parameters:
+            - date_from: Start date (ISO format)
+            - date_to: End date (ISO format)
+
+        Returns:
+            Summary statistics
+        """
+        # This is a placeholder - implement based on requirements
+        return Response({
+            "message": "Summary endpoint - implement based on requirements",
+            "date_from": request.query_params.get("date_from"),
+            "date_to": request.query_params.get("date_to"),
+        })
+
+    @extend_schema(
+        responses={200: dict},
+        description="Health check for headless API",
+    )
+    @action(methods=["GET"], detail=False, url_path="health")
+    def health(self, request: Request, **kwargs) -> Response:
+        """
+        Health check endpoint for monitoring.
+
+        Returns:
+            Health status
+        """
+        return Response({
+            "status": "healthy",
+            "version": "1.0.0",
+            "features": [
+                "query_execution",
+                "data_transforms",
+                "csv_export",
+                "webhook_format",
+            ],
+        })
