@@ -61,6 +61,7 @@ frontend/pnpm-error.log
 frontend/public/Matter*.woff* # Paid font
 frontend/tmp
 frontend/types/
+frontend/src/lib/api-types.ts  # Auto-generated from OpenAPI schema
 frontend/src/products.tsx
 # Vite-specific assets (we copy public assets to src/assets) just for development
 frontend/src/assets
